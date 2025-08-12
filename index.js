@@ -19,9 +19,13 @@ wss.on('connection', (ws) => {
       const data = JSON.parse(msg);
       const { type, payload } = data;
 
+      // Присоединение к комнате
       if (type === 'join') {
         const { roomName, name } = payload;
         if (!roomName || !name) return;
+
+        // Если игрок был в другой комнате — удалить его оттуда
+        leaveRoom(ws);
 
         if (!rooms.has(roomName)) {
           rooms.set(roomName, { players: new Map() });
@@ -38,6 +42,7 @@ wss.on('connection', (ws) => {
         broadcastRoom(roomName);
       }
 
+      // Перемещение
       if (type === 'move') {
         const { x, y } = payload;
         const { roomName } = ws.playerInfo;
@@ -53,31 +58,58 @@ wss.on('connection', (ws) => {
         broadcastRoom(roomName);
       }
 
+      // Выход из комнаты по сообщению
+      if (type === 'leave') {
+        leaveRoom(ws);
+      }
+
+      // Запрос списка комнат
+      if (type === 'get_rooms') {
+  const dataObj = {};
+  for (const [roomName, room] of rooms.entries()) {
+    dataObj[roomName] = `${room.players.size} plays`;
+  }
+
+  const message = JSON.stringify({
+    c2dictionary: true,
+    data: dataObj
+  });
+
+  ws.send(message);
+}
+
     } catch (err) {
       console.error('Invalid message:', msg);
     }
   });
 
   ws.on('close', () => {
-    const { roomName, name } = ws.playerInfo;
-    if (roomName && rooms.has(roomName)) {
-      const room = rooms.get(roomName);
-      room.players.delete(ws);
-      console.log(`Player "${name}" left "${roomName}"`);
-
-      if (room.players.size === 0) {
-        rooms.delete(roomName);
-        console.log(`Room "${roomName}" deleted`);
-      } else {
-        broadcastRoom(roomName);
-      }
-    }
+    leaveRoom(ws);
   });
 
   ws.on('error', (err) => {
     console.error('WebSocket error:', err);
   });
 });
+
+// Функция удаления игрока из комнаты
+function leaveRoom(ws) {
+  const { roomName, name } = ws.playerInfo;
+  if (roomName && rooms.has(roomName)) {
+    const room = rooms.get(roomName);
+    room.players.delete(ws);
+    console.log(`Player "${name}" left "${roomName}"`);
+
+    ws.playerInfo.roomName = null;
+
+    if (room.players.size === 0) {
+      rooms.delete(roomName);
+      console.log(`Room "${roomName}" deleted`);
+    } else {
+      broadcastRoom(roomName);
+    }
+  }
+}
 
 // Функция рассылки данных в формате Construct 2 c2dictionary
 function broadcastRoom(roomName) {
