@@ -1,0 +1,204 @@
+import greeting from "@colyseus/greeting-banner";
+import { debugAndPrintError, debugMatchMaking } from "./Debug";
+import * as matchMaker from "./MatchMaker";
+import { Room } from "./Room";
+import { getBearerToken, registerGracefulShutdown } from "./utils/Utils";
+import { registerNode, unregisterNode } from "./discovery";
+import { LocalPresence } from "./presence/LocalPresence";
+import { LocalDriver } from "./matchmaker/driver";
+import { logger, setLogger } from "./Logger";
+import { setDevMode, isDevMode } from "./utils/DevMode";
+class Server {
+  constructor(options = {}) {
+    this._originalRoomOnMessage = null;
+    this.onShutdownCallback = () => Promise.resolve();
+    this.onBeforeShutdownCallback = () => Promise.resolve();
+    const { gracefullyShutdown = true, greet = true } = options;
+    setDevMode(options.devMode === true);
+    this.presence = options.presence || new LocalPresence();
+    this.driver = options.driver || new LocalDriver();
+    this.greet = greet;
+    this.attach(options);
+    matchMaker.setup(
+      this.presence,
+      this.driver,
+      options.publicAddress,
+      options.selectProcessIdToCreateRoom
+    );
+    if (gracefullyShutdown) {
+      registerGracefulShutdown((err) => this.gracefullyShutdown(true, err));
+    }
+    if (options.logger) {
+      setLogger(options.logger);
+    }
+  }
+  attach(options) {
+    if (options.pingInterval !== void 0 || options.pingMaxRetries !== void 0 || options.server !== void 0 || options.verifyClient !== void 0) {
+      logger.warn("DEPRECATION WARNING: 'pingInterval', 'pingMaxRetries', 'server', and 'verifyClient' Server options will be permanently moved to WebSocketTransport on v0.15");
+      logger.warn(`new Server({
+  transport: new WebSocketTransport({
+    pingInterval: ...,
+    pingMaxRetries: ...,
+    server: ...,
+    verifyClient: ...
+  })
+})`);
+      logger.warn("\u{1F449} Documentation: https://docs.colyseus.io/server/transport/");
+    }
+    const transport = options.transport || this.getDefaultTransport(options);
+    delete options.transport;
+    this.transport = transport;
+    if (this.transport.server) {
+      this.transport.server.once("listening", () => this.registerProcessForDiscovery());
+      this.attachMatchMakingRoutes(this.transport.server);
+    }
+  }
+  async listen(port, hostname, backlog, listeningListener) {
+    this.port = port;
+    await matchMaker.accept();
+    if (this.greet) {
+      console.log(greeting);
+    }
+    return new Promise((resolve, reject) => {
+      this.transport.server?.on("error", (err) => reject(err));
+      this.transport.listen(port, hostname, backlog, (err) => {
+        if (listeningListener) {
+          listeningListener(err);
+        }
+        if (err) {
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+  async registerProcessForDiscovery() {
+    await registerNode(this.presence, {
+      port: this.port,
+      processId: matchMaker.processId
+    });
+  }
+  define(nameOrHandler, handlerOrOptions, defaultOptions) {
+    const name = typeof nameOrHandler === "string" ? nameOrHandler : nameOrHandler.name;
+    const roomClass = typeof nameOrHandler === "string" ? handlerOrOptions : nameOrHandler;
+    const options = typeof nameOrHandler === "string" ? defaultOptions : handlerOrOptions;
+    return matchMaker.defineRoomType(name, roomClass, options);
+  }
+  removeRoomType(name) {
+    matchMaker.removeRoomType(name);
+  }
+  async gracefullyShutdown(exit = true, err) {
+    if (matchMaker.isGracefullyShuttingDown) {
+      return;
+    }
+    await unregisterNode(this.presence, {
+      port: this.port,
+      processId: matchMaker.processId
+    });
+    try {
+      await this.onBeforeShutdownCallback();
+      await matchMaker.gracefullyShutdown();
+      this.transport.shutdown();
+      this.presence.shutdown();
+      this.driver.shutdown();
+      await this.onShutdownCallback();
+    } catch (e) {
+      debugAndPrintError(`error during shutdown: ${e}`);
+    } finally {
+      if (exit) {
+        process.exit(err && !isDevMode ? 1 : 0);
+      }
+    }
+  }
+  simulateLatency(milliseconds) {
+    if (milliseconds > 0) {
+      logger.warn(`\u{1F4F6}\uFE0F\u2757 Colyseus latency simulation enabled \u2192 ${milliseconds}ms latency for round trip.`);
+    } else {
+      logger.warn(`\u{1F4F6}\uFE0F\u2757 Colyseus latency simulation disabled.`);
+    }
+    const halfwayMS = milliseconds / 2;
+    this.transport.simulateLatency(halfwayMS);
+    if (this._originalRoomOnMessage == null) {
+      this._originalRoomOnMessage = Room.prototype["_onMessage"];
+    }
+    const originalOnMessage = this._originalRoomOnMessage;
+    Room.prototype["_onMessage"] = milliseconds <= Number.EPSILON ? originalOnMessage : function(client, buffer) {
+      const cachedBuffer = Buffer.from(buffer);
+      setTimeout(() => originalOnMessage.call(this, client, cachedBuffer), halfwayMS);
+    };
+  }
+  onShutdown(callback) {
+    this.onShutdownCallback = callback;
+  }
+  onBeforeShutdown(callback) {
+    this.onBeforeShutdownCallback = callback;
+  }
+  getDefaultTransport(_) {
+    throw new Error("Please provide a 'transport' layer. Default transport not set.");
+  }
+  attachMatchMakingRoutes(server) {
+    const listeners = server.listeners("request").slice(0);
+    server.removeAllListeners("request");
+    server.on("request", (req, res) => {
+      if (req.url.indexOf(`/${matchMaker.controller.matchmakeRoute}`) !== -1) {
+        debugMatchMaking("received matchmake request: %s", req.url);
+        this.handleMatchMakeRequest(req, res);
+      } else {
+        for (let i = 0, l = listeners.length; i < l; i++) {
+          listeners[i].call(server, req, res);
+        }
+      }
+    });
+  }
+  async handleMatchMakeRequest(req, res) {
+    if (matchMaker.isGracefullyShuttingDown) {
+      res.writeHead(503, {});
+      res.end();
+      return;
+    }
+    const headers = Object.assign(
+      {},
+      matchMaker.controller.DEFAULT_CORS_HEADERS,
+      matchMaker.controller.getCorsHeaders.call(void 0, req)
+    );
+    if (req.method === "OPTIONS") {
+      res.writeHead(204, headers);
+      res.end();
+    } else if (req.method === "POST") {
+      const matchedParams = req.url.match(matchMaker.controller.allowedRoomNameChars);
+      const matchmakeIndex = matchedParams.indexOf(matchMaker.controller.matchmakeRoute);
+      const method = matchedParams[matchmakeIndex + 1];
+      const roomName = matchedParams[matchmakeIndex + 2] || "";
+      const data = [];
+      req.on("data", (chunk) => data.push(chunk));
+      req.on("end", async () => {
+        headers["Content-Type"] = "application/json";
+        res.writeHead(200, headers);
+        try {
+          const clientOptions = JSON.parse(Buffer.concat(data).toString());
+          const response = await matchMaker.controller.invokeMethod(
+            method,
+            roomName,
+            clientOptions,
+            { token: getBearerToken(req.headers["authorization"]), request: req }
+          );
+          res.write(JSON.stringify(response));
+        } catch (e) {
+          res.write(JSON.stringify({ code: e.code, error: e.message }));
+        }
+        res.end();
+      });
+    } else if (req.method === "GET") {
+      const matchedParams = req.url.match(matchMaker.controller.allowedRoomNameChars);
+      const roomName = matchedParams.length > 1 ? matchedParams[matchedParams.length - 1] : "";
+      headers["Content-Type"] = "application/json";
+      res.writeHead(200, headers);
+      res.write(JSON.stringify(await matchMaker.controller.getAvailableRooms(roomName)));
+      res.end();
+    }
+  }
+}
+export {
+  Server
+};
